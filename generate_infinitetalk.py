@@ -450,6 +450,223 @@ def process_tts_multi(text, save_dir, voice1, voice2):
     # sum, _ = librosa.load(save_path_sum, sr=16000)
     return s1, s2, save_path_sum
 
+def load_pipeline(ckpt_dir, wav2vec_dir, infinitetalk_dir, lora_dir=None, lora_scale=1.0, offload_model=False):
+    """
+    Load the InfiniteTalk pipeline into memory.
+    
+    Args:
+        ckpt_dir: Path to Wan checkpoint directory
+        wav2vec_dir: Path to wav2vec checkpoint directory
+        infinitetalk_dir: Path to InfiniteTalk checkpoint file (e.g., single/infinitetalk.safetensors)
+        lora_dir: Optional path to LoRA checkpoint file
+        lora_scale: LoRA scale factor (default: 1.0)
+        offload_model: Whether to offload model to CPU after forward pass (default: False)
+    
+    Returns:
+        InfiniteTalkPipeline: Loaded pipeline instance
+    """
+    rank = int(os.getenv("RANK", 0))
+    world_size = int(os.getenv("WORLD_SIZE", 1))
+    local_rank = int(os.getenv("LOCAL_RANK", 0))
+    device = local_rank
+    
+    # Initialize logging
+    _init_logging(rank)
+    
+    # Set default offload_model if not specified
+    if offload_model is None:
+        offload_model = False if world_size > 1 else True
+    
+    # Get config for infinitetalk-14B task
+    task = "infinitetalk-14B"
+    cfg = WAN_CONFIGS[task]
+    
+    # Create pipeline
+    logging.info("Creating infinitetalk pipeline.")
+    pipeline = wan.InfiniteTalkPipeline(
+        config=cfg,
+        checkpoint_dir=ckpt_dir,
+        quant_dir=None,
+        device_id=device,
+        rank=rank,
+        t5_fsdp=False,
+        dit_fsdp=False,
+        use_usp=False,
+        t5_cpu=False,
+        lora_dir=[lora_dir] if lora_dir else None,
+        lora_scales=[lora_scale] if lora_dir else None,
+        quant=None,
+        dit_path=None,
+        infinitetalk_dir=infinitetalk_dir
+    )
+    
+    logging.info("Pipeline loaded successfully.")
+    return pipeline
+
+def run_pipeline(pipeline, input_json_path, size, text_scale, audio_scale, steps, motion_frame=9, max_frames=1000, output_path=None, lora_dir=None, lora_scale=1.0, sample_shift=2, mode="streaming", use_teacache=True, teacache_thresh=0.2, num_persistent_param_in_dit=0, wav2vec_dir=None):
+    """
+    Run inference using a pre-loaded pipeline.
+    
+    Args:
+        pipeline: Pre-loaded InfiniteTalkPipeline instance
+        input_json_path: Path to input JSON file
+        size: Size bucket (e.g., "infinitetalk-480" or "infinitetalk-720")
+        text_scale: Text guidance scale
+        audio_scale: Audio guidance scale
+        steps: Number of sampling steps
+        motion_frame: Motion frame parameter (default: 9)
+        max_frames: Maximum frames to generate (default: 1000)
+        output_path: Output video path (default: /tmp/outputs/infinitetalk_result.mp4)
+        lora_dir: Optional LoRA directory (ignored - LoRA should be loaded during pipeline initialization)
+        lora_scale: LoRA scale (ignored - LoRA should be loaded during pipeline initialization)
+        sample_shift: Sampling shift factor (default: 2)
+        mode: Generation mode - "streaming" or "clip" (default: "streaming")
+        use_teacache: Enable teacache (default: True)
+        teacache_thresh: Teacache threshold (default: 0.2)
+        num_persistent_param_in_dit: VRAM management parameter (default: 0)
+        wav2vec_dir: Path to wav2vec directory (required for processing raw audio files)
+    
+    Returns:
+        str: Path to generated video file
+    """
+    rank = int(os.getenv("RANK", 0))
+    
+    # Load input JSON
+    with open(input_json_path, 'r', encoding='utf-8') as f:
+        input_data = json.load(f)
+    
+    # Set default output path
+    if output_path is None:
+        output_path = "/tmp/outputs/infinitetalk_result.mp4"
+    
+    # Ensure output directory exists
+    os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else "/tmp/outputs", exist_ok=True)
+    
+    # Create a mock args object for compatibility with existing code
+    class MockArgs:
+        def __init__(self):
+            self.audio_save_dir = os.path.join('save_audio', input_data['cond_video'].split('/')[-1].split('.')[0])
+            self.audio_mode = 'localfile'
+            self.scene_seg = False
+            self.base_seed = random.randint(0, 99999999) if random.randint(0, 99999999) >= 0 else random.randint(0, 99999999)
+            self.frame_num = 81
+            self.use_teacache = use_teacache
+            self.teacache_thresh = teacache_thresh
+            self.size = size
+            self.color_correction_strength = 1.0
+    
+    args = MockArgs()
+    os.makedirs(args.audio_save_dir, exist_ok=True)
+    
+    # Process audio embeddings
+    cond_audio = input_data.get('cond_audio', {})
+    cond_audio_processed = {}
+    
+    if 'person1' in cond_audio:
+        audio_path = cond_audio['person1']
+        if audio_path.endswith('.pt'):
+            # Already an embedding file
+            cond_audio_processed['person1'] = audio_path
+        else:
+            # Need to process raw audio file
+            if wav2vec_dir is None:
+                raise ValueError("wav2vec_dir is required for processing raw audio files. "
+                               "Either provide wav2vec_dir or use pre-computed .pt embedding files.")
+            
+            # Initialize audio encoder
+            wav2vec_feature_extractor, audio_encoder = custom_init('cpu', wav2vec_dir)
+            
+            # Process audio
+            if len(cond_audio) == 1:
+                # Single person
+                human_speech = audio_prepare_single(audio_path)
+                audio_embedding = get_embedding(human_speech, wav2vec_feature_extractor, audio_encoder)
+                emb_path = os.path.join(args.audio_save_dir, '1.pt')
+                sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
+                sf.write(sum_audio, human_speech, 16000)
+                torch.save(audio_embedding, emb_path)
+                cond_audio_processed['person1'] = emb_path
+                input_data['video_audio'] = sum_audio
+            else:
+                # Multi-person
+                audio_path2 = cond_audio.get('person2', 'None')
+                audio_type = input_data.get('audio_type', 'para')
+                new_human_speech1, new_human_speech2, sum_human_speechs = audio_prepare_multi(
+                    audio_path, audio_path2, audio_type
+                )
+                audio_embedding_1 = get_embedding(new_human_speech1, wav2vec_feature_extractor, audio_encoder)
+                audio_embedding_2 = get_embedding(new_human_speech2, wav2vec_feature_extractor, audio_encoder)
+                emb1_path = os.path.join(args.audio_save_dir, '1.pt')
+                emb2_path = os.path.join(args.audio_save_dir, '2.pt')
+                sum_audio = os.path.join(args.audio_save_dir, 'sum.wav')
+                sf.write(sum_audio, sum_human_speechs, 16000)
+                torch.save(audio_embedding_1, emb1_path)
+                torch.save(audio_embedding_2, emb2_path)
+                cond_audio_processed['person1'] = emb1_path
+                cond_audio_processed['person2'] = emb2_path
+                input_data['video_audio'] = sum_audio
+    
+    # Prepare input clip
+    input_clip = {
+        'prompt': input_data.get('prompt', 'A person is speaking'),
+        'cond_video': input_data['cond_video'],
+        'cond_audio': cond_audio_processed,
+    }
+    
+    if 'audio_type' in input_data:
+        input_clip['audio_type'] = input_data['audio_type']
+    if 'bbox' in input_data:
+        input_clip['bbox'] = input_data['bbox']
+    if 'video_audio' in input_data:
+        input_clip['video_audio'] = input_data['video_audio']
+    
+    # Determine frame_num based on mode
+    if mode == 'clip':
+        frame_num = args.frame_num
+    else:
+        frame_num = args.frame_num  # Will be limited by max_frames_num
+    
+    # Enable VRAM management if specified
+    if num_persistent_param_in_dit is not None and num_persistent_param_in_dit >= 0:
+        pipeline.vram_management = True
+        pipeline.enable_vram_management(num_persistent_param_in_dit=num_persistent_param_in_dit)
+    
+    # Generate video
+    logging.info("Generating video ...")
+    video = pipeline.generate_infinitetalk(
+        input_clip,
+        size_buckget=size,
+        motion_frame=motion_frame,
+        frame_num=frame_num,
+        shift=sample_shift if sample_shift else (7 if size == 'infinitetalk-480' else 11),
+        sampling_steps=steps,
+        text_guide_scale=float(text_scale),
+        audio_guide_scale=float(audio_scale),
+        seed=args.base_seed,
+        offload_model=False,  # Use pipeline's default or passed parameter
+        max_frames_num=frame_num if mode == 'clip' else max_frames,
+        color_correction_strength=args.color_correction_strength,
+        extra_args=args,
+    )
+    
+    # Save video
+    if rank == 0:
+        # Ensure output path has .mp4 extension
+        if not output_path.endswith('.mp4'):
+            output_path = output_path + '.mp4'
+        
+        # Get video audio path if available
+        video_audio = input_data.get('video_audio', None)
+        audio_paths = [video_audio] if video_audio else []
+        
+        save_video_ffmpeg(video, output_path.replace('.mp4', ''), audio_paths, high_quality_save=False)
+        final_path = output_path.replace('.mp4', '') + '.mp4'
+        
+        logging.info(f"Saving generated video to {final_path}")
+        return final_path
+    else:
+        return None
+
 def generate(args):
     rank = int(os.getenv("RANK", 0))
     world_size = int(os.getenv("WORLD_SIZE", 1))
