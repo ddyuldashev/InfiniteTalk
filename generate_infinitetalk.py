@@ -554,6 +554,10 @@ def run_pipeline(pipeline, input_json_path, size, text_scale, audio_scale, steps
             self.teacache_thresh = teacache_thresh
             self.size = size
             self.color_correction_strength = 1.0
+            # APG (Adaptive Projected Guidance) settings
+            self.use_apg = False
+            self.apg_momentum = -0.75
+            self.apg_norm_threshold = 55
     
     args = MockArgs()
     os.makedirs(args.audio_save_dir, exist_ok=True)
