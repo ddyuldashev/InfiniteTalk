@@ -137,7 +137,7 @@ class WanSelfAttention(nn.Module):
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
 
-    def forward(self, x, seq_lens, grid_sizes, freqs, ref_target_masks=None):
+    def forward(self, x, seq_lens, grid_sizes, freqs, ref_target_masks=None, human_num=None):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
         # query, key, value function
@@ -165,9 +165,18 @@ class WanSelfAttention(nn.Module):
         # output
         x = x.flatten(2)
         x = self.o(x)
-        with torch.no_grad():
-            x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0], 
-                                                    ref_target_masks=ref_target_masks)
+        
+        # Skip expensive attention map computation for single-person mode.
+        # get_attn_map_with_target computes a dense Q*K^T matrix in every layer,
+        # but the result is only used by audio_cross_attn when human_num > 1.
+        # For single-person (human_num == 1), audio_cross_attn falls back to
+        # the parent class which ignores x_ref_attn_map entirely.
+        if human_num is not None and human_num <= 1:
+            x_ref_attn_map = None
+        else:
+            with torch.no_grad():
+                x_ref_attn_map = get_attn_map_with_target(q.type_as(x), k.type_as(x), grid_sizes[0], 
+                                                        ref_target_masks=ref_target_masks)
 
         return x, x_ref_attn_map
 
@@ -294,7 +303,7 @@ class WanAttentionBlock(nn.Module):
         # self-attention
         y, x_ref_attn_map = self.self_attn(
             (self.norm1(x).float() * (1 + e[1]) + e[0]).type_as(x), seq_lens, grid_sizes,
-            freqs, ref_target_masks=ref_target_masks)
+            freqs, ref_target_masks=ref_target_masks, human_num=human_num)
         with amp.autocast(dtype=torch.float32):
             x = x + y * e[2]
         
