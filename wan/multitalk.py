@@ -564,7 +564,7 @@ class InfiniteTalkPipeline:
                 clip_context = self.clip.visual(cond_image[:, :, -1:, :, :]).to(self.param_dtype) 
                 if offload_model:
                     self.clip.model.cpu()
-                torch_gc()
+                    torch_gc()
 
                 # zero padding and vae encode
                 video_frames = torch.zeros(1, cond_image.shape[1], frame_num-cond_image.shape[2], target_h, target_w).to(self.device)
@@ -684,7 +684,8 @@ class InfiniteTalkPipeline:
                     'ref_target_masks': ref_target_masks
                 }
 
-                torch_gc()
+                if self.vram_management:
+                    torch_gc()
                 if not self.vram_management:
                     self.model.to(self.device)
                 else:
@@ -714,19 +715,23 @@ class InfiniteTalkPipeline:
                     # inference with CFG strategy
                     noise_pred_cond = self.model(
                     latent_model_input, t=timestep, **arg_c)[0] 
-                    torch_gc()
+                    if self.vram_management:
+                        torch_gc()
 
                     if math.isclose(text_guide_scale, 1.0):
                         noise_pred_drop_audio = self.model(
                             latent_model_input, t=timestep, **arg_null_audio)[0]  
-                        torch_gc()
+                        if self.vram_management:
+                            torch_gc()
                     else:
                         noise_pred_drop_text = self.model(
                             latent_model_input, t=timestep, **arg_null_text)[0] 
-                        torch_gc()
+                        if self.vram_management:
+                            torch_gc()
                         noise_pred_uncond = self.model(
                             latent_model_input, t=timestep, **arg_null)[0]  
-                        torch_gc()
+                        if self.vram_management:
+                            torch_gc()
 
                     if extra_args.use_apg:
                         # correct update direction
@@ -777,7 +782,7 @@ class InfiniteTalkPipeline:
                 if offload_model: 
                     if not self.vram_management:
                         self.model.cpu()
-                torch_gc()
+                    torch_gc()  # only needed when offloading to free GPU mem before VAE decode
 
                 videos = self.vae.decode(x0)
             
