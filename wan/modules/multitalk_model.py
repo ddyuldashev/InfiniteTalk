@@ -172,6 +172,9 @@ class WanSelfAttention(nn.Module):
         # For single-person (human_num == 1), audio_cross_attn falls back to
         # the parent class which ignores x_ref_attn_map entirely.
         if human_num is not None and human_num <= 1:
+            if not hasattr(self, '_skip_logged'):
+                print(f"[PERF] Skipping get_attn_map_with_target (human_num={human_num})")
+                self._skip_logged = True
             x_ref_attn_map = None
         else:
             with torch.no_grad():
