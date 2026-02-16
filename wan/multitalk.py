@@ -409,9 +409,17 @@ class InfiniteTalkPipeline:
                 If True, offloads models to CPU during generation to save VRAM
         """
 
-        # init teacache (passes_per_step must match actual CFG: 2 when text_guide_scale==1.0, else 3)
+        # init teacache (passes_per_step must match actual forward passes per step)
+        # 1-pass: text_guide_scale==1.0 and audio_guide_scale==1.0 → skip 2nd pass
+        # 2-pass: text_guide_scale==1.0 and audio_guide_scale!=1.0 → cond + drop_audio
+        # 3-pass: text_guide_scale!=1.0 → cond + drop_text + uncond
         if extra_args.use_teacache:
-            passes_per_step = 2 if math.isclose(text_guide_scale, 1.0) else 3
+            if math.isclose(text_guide_scale, 1.0) and math.isclose(audio_guide_scale, 1.0):
+                passes_per_step = 1
+            elif math.isclose(text_guide_scale, 1.0):
+                passes_per_step = 2
+            else:
+                passes_per_step = 3
             self.model.teacache_init(
                 sample_steps=sampling_steps,
                 teacache_thresh=extra_args.teacache_thresh,
@@ -720,11 +728,15 @@ class InfiniteTalkPipeline:
                     if self.vram_management:
                         torch_gc()
 
+                    # 1-pass: when audio_guide_scale==1.0, formula reduces to noise_pred_cond; skip 2nd forward
                     if math.isclose(text_guide_scale, 1.0):
-                        noise_pred_drop_audio = self.model(
-                            latent_model_input, t=timestep, **arg_null_audio)[0]  
-                        if self.vram_management:
-                            torch_gc()
+                        if math.isclose(audio_guide_scale, 1.0):
+                            noise_pred_drop_audio = noise_pred_cond
+                        else:
+                            noise_pred_drop_audio = self.model(
+                                latent_model_input, t=timestep, **arg_null_audio)[0]  
+                            if self.vram_management:
+                                torch_gc()
                     else:
                         noise_pred_drop_text = self.model(
                             latent_model_input, t=timestep, **arg_null_text)[0] 
