@@ -409,12 +409,14 @@ class InfiniteTalkPipeline:
                 If True, offloads models to CPU during generation to save VRAM
         """
 
-        # init teacache
+        # init teacache (passes_per_step must match actual CFG: 2 when text_guide_scale==1.0, else 3)
         if extra_args.use_teacache:
+            passes_per_step = 2 if math.isclose(text_guide_scale, 1.0) else 3
             self.model.teacache_init(
                 sample_steps=sampling_steps,
                 teacache_thresh=extra_args.teacache_thresh,
                 model_scale=extra_args.size,
+                passes_per_step=passes_per_step,
             )
         else:
             self.model.disable_teacache()

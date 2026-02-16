@@ -569,12 +569,19 @@ class WanModel(ModelMixin, ConfigMixin):
         teacache_thresh=0.2,
         sample_steps=40,
         model_scale='infinitetalk-480',
+        passes_per_step=3,
     ):
+        """
+        Initialize TeaCache for the sampling loop.
+        passes_per_step: 2 when text_guide_scale==1.0 (cond + drop_audio only),
+                         3 when text_guide_scale!=1.0 (cond + drop_text + uncond).
+        Must match the actual number of model forward passes per diffusion step.
+        """
         print("teacache_init")
         self.enable_teacache = True
-        
+        self.__class__.passes_per_step = passes_per_step
         self.__class__.cnt = 0
-        self.__class__.num_steps = sample_steps*3
+        self.__class__.num_steps = sample_steps * passes_per_step
         self.__class__.teacache_thresh = teacache_thresh
         self.__class__.accumulated_rel_l1_distance_even = 0
         self.__class__.accumulated_rel_l1_distance_odd = 0
@@ -589,17 +596,17 @@ class WanModel(ModelMixin, ConfigMixin):
                 self.__class__.coefficients = [ 2.57151496e+05, -3.54229917e+04,  1.40286849e+03, -1.35890334e+01, 1.32517977e-01]
             if model_scale == 'infinitetalk-720':
                 self.__class__.coefficients = [ 8.10705460e+03,  2.13393892e+03, -3.72934672e+02,  1.66203073e+01, -4.17769401e-02]
-            self.__class__.ret_steps = 5*3
-            self.__class__.cutoff_steps = sample_steps*3
+            self.__class__.ret_steps = 5 * passes_per_step
+            self.__class__.cutoff_steps = sample_steps * passes_per_step
         else:
             if model_scale == 'infinitetalk-480':
                 self.__class__.coefficients = [-3.02331670e+02,  2.23948934e+02, -5.25463970e+01,  5.87348440e+00, -2.01973289e-01]
         
             if model_scale == 'infinitetalk-720':
                 self.__class__.coefficients = [-114.36346466,   65.26524496,  -18.82220707,    4.91518089,   -0.23412683]
-            self.__class__.ret_steps = 1*3
-            self.__class__.cutoff_steps = sample_steps*3 - 3
-        print("teacache_init done")
+            self.__class__.ret_steps = 1 * passes_per_step
+            self.__class__.cutoff_steps = sample_steps * passes_per_step - passes_per_step
+        print(f"teacache_init done (passes_per_step={passes_per_step}, num_steps={self.__class__.num_steps})")
     
     def disable_teacache(self):
         self.enable_teacache = False
@@ -686,10 +693,11 @@ class WanModel(ModelMixin, ConfigMixin):
             token_ref_target_masks = token_ref_target_masks.view(token_ref_target_masks.shape[0], -1) 
             token_ref_target_masks = token_ref_target_masks.to(x.dtype)
 
-        # teacache
+        # teacache: pass_type must match actual call order (cond, then drop_audio or drop_text, then uncond if 3-pass)
         if self.enable_teacache:
             modulated_inp = e0 if self.use_ret_steps else e
-            if self.cnt%3==0: # cond
+            pass_type = self.cnt % self.passes_per_step  # 0=cond, 1=drop_audio (2-pass) or drop_text (3-pass), 2=uncond (3-pass only)
+            if pass_type == 0:  # cond
                 if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
                     should_calc_cond = True
                     self.accumulated_rel_l1_distance_cond = 0
@@ -702,7 +710,7 @@ class WanModel(ModelMixin, ConfigMixin):
                         should_calc_cond = True
                         self.accumulated_rel_l1_distance_cond = 0
                 self.previous_e0_cond = modulated_inp.clone()
-            elif self.cnt%3==1: # drop_text
+            elif pass_type == 1:  # drop_audio (2-pass) or drop_text (3-pass)
                 if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
                     should_calc_drop_text = True
                     self.accumulated_rel_l1_distance_drop_text = 0
@@ -715,7 +723,7 @@ class WanModel(ModelMixin, ConfigMixin):
                         should_calc_drop_text = True
                         self.accumulated_rel_l1_distance_drop_text = 0
                 self.previous_e0_drop_text = modulated_inp.clone()
-            else: # uncond
+            else:  # pass_type == 2: uncond (3-pass only)
                 if self.cnt < self.ret_steps or self.cnt >= self.cutoff_steps:
                     should_calc_uncond = True
                     self.accumulated_rel_l1_distance_uncond = 0
@@ -742,7 +750,7 @@ class WanModel(ModelMixin, ConfigMixin):
             human_num=human_num,
             )
         if self.enable_teacache:
-            if self.cnt%3==0:
+            if pass_type == 0:
                 if not should_calc_cond:
                     x +=  self.previous_residual_cond
                 else:
@@ -750,7 +758,7 @@ class WanModel(ModelMixin, ConfigMixin):
                     for block in self.blocks:
                         x = block(x, **kwargs)
                     self.previous_residual_cond = x - ori_x
-            elif self.cnt%3==1:
+            elif pass_type == 1:
                 if not should_calc_drop_text:
                     x +=  self.previous_residual_drop_text
                 else:
@@ -758,7 +766,7 @@ class WanModel(ModelMixin, ConfigMixin):
                     for block in self.blocks:
                         x = block(x, **kwargs)
                     self.previous_residual_drop_text = x - ori_x
-            else:
+            else:  # pass_type == 2 (3-pass only)
                 if not should_calc_uncond:
                     x +=  self.previous_residual_uncond
                 else:
