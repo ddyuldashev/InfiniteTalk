@@ -611,6 +611,46 @@ class WanModel(ModelMixin, ConfigMixin):
     def disable_teacache(self):
         self.enable_teacache = False
 
+    def precompute_audio_embedding(self, audio, dtype=None):
+        """
+        Pre-compute audio embeddings once before the denoising loop.
+        
+        The audio_proj computation is deterministic and doesn't depend on the 
+        noisy latent, so it can be computed once and reused across all denoising
+        steps instead of being recomputed in every forward() call.
+        
+        Args:
+            audio: Raw audio tensor [B, T, W, S, C] from wav2vec
+            dtype: Target dtype (default: audio.dtype)
+            
+        Returns:
+            dict with 'audio_embedding' and 'human_num' to pass to forward()
+        """
+        if dtype is None:
+            dtype = audio.dtype
+        device = audio.device
+        
+        audio_cond = audio.to(device=device, dtype=dtype)
+        first_frame_audio_emb_s = audio_cond[:, :1, ...] 
+        latter_frame_audio_emb = audio_cond[:, 1:, ...] 
+        latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale) 
+        middle_index = self.audio_window // 2
+        latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
+        latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
+        latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] 
+        latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
+        latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
+        latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
+        latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
+        audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) 
+        human_num = len(audio_embedding)
+        audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(dtype)
+        
+        return {
+            'audio_embedding': audio_embedding,
+            'human_num': human_num,
+        }
+
     def forward(
             self,
             x,
@@ -621,6 +661,7 @@ class WanModel(ModelMixin, ConfigMixin):
             y=None,
             audio=None,
             ref_target_masks=None,
+            precomputed_audio=None,
         ):
         assert clip_fea is not None and y is not None
 
@@ -666,23 +707,27 @@ class WanModel(ModelMixin, ConfigMixin):
             context_clip = self.img_emb(clip_fea) 
             context = torch.concat([context_clip, context], dim=1).to(x.dtype)
 
-        
-        audio_cond = audio.to(device=x.device, dtype=x.dtype)
-        first_frame_audio_emb_s = audio_cond[:, :1, ...] 
-        latter_frame_audio_emb = audio_cond[:, 1:, ...] 
-        latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale) 
-        middle_index = self.audio_window // 2
-        latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
-        latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-        latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] 
-        latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-        latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
-        latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
-        latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
-        audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) 
-        human_num = len(audio_embedding)
-        audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
-
+        # Use pre-computed audio embeddings if provided (optimization: avoids recomputing every step)
+        if precomputed_audio is not None:
+            audio_embedding = precomputed_audio['audio_embedding'].to(x.dtype)
+            human_num = precomputed_audio['human_num']
+        else:
+            # Compute audio embeddings (original path, used when precomputed_audio not provided)
+            audio_cond = audio.to(device=x.device, dtype=x.dtype)
+            first_frame_audio_emb_s = audio_cond[:, :1, ...] 
+            latter_frame_audio_emb = audio_cond[:, 1:, ...] 
+            latter_frame_audio_emb = rearrange(latter_frame_audio_emb, "b (n_t n) w s c -> b n_t n w s c", n=self.vae_scale) 
+            middle_index = self.audio_window // 2
+            latter_first_frame_audio_emb = latter_frame_audio_emb[:, :, :1, :middle_index+1, ...] 
+            latter_first_frame_audio_emb = rearrange(latter_first_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
+            latter_last_frame_audio_emb = latter_frame_audio_emb[:, :, -1:, middle_index:, ...] 
+            latter_last_frame_audio_emb = rearrange(latter_last_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
+            latter_middle_frame_audio_emb = latter_frame_audio_emb[:, :, 1:-1, middle_index:middle_index+1, ...] 
+            latter_middle_frame_audio_emb = rearrange(latter_middle_frame_audio_emb, "b n_t n w s c -> b n_t (n w) s c") 
+            latter_frame_audio_emb_s = torch.concat([latter_first_frame_audio_emb, latter_middle_frame_audio_emb, latter_last_frame_audio_emb], dim=2) 
+            audio_embedding = self.audio_proj(first_frame_audio_emb_s, latter_frame_audio_emb_s) 
+            human_num = len(audio_embedding)
+            audio_embedding = torch.concat(audio_embedding.split(1), dim=2).to(x.dtype)
 
         # convert ref_target_masks to token_ref_target_masks
         if ref_target_masks is not None:
